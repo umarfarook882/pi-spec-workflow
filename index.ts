@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -40,6 +41,8 @@ interface SpecState {
     id: string;
     attempts: number;
     started: string;
+    test_cmd?: string;
+    verified?: boolean;
   };
 }
 
@@ -83,9 +86,23 @@ function parseFrontmatter(content: string): {
   const fm: Record<string, any> = {};
 
   let currentKey = "";
+  let inMultilineString = false;
+  let multilineValue: string[] = [];
 
   for (const line of yaml.split("\n")) {
     const trimmed = line.trim();
+
+    if (inMultilineString) {
+      if (line.startsWith("  ") || line.startsWith("\t") || trimmed === "") {
+        multilineValue.push(trimmed);
+        continue;
+      } else {
+        fm[currentKey] = multilineValue.join("\n").trim();
+        inMultilineString = false;
+        multilineValue = [];
+      }
+    }
+
     if (!trimmed || trimmed.startsWith("#")) continue;
 
     // Top-level key: value
@@ -97,6 +114,9 @@ function parseFrontmatter(content: string): {
       if (!value) {
         // Key with no inline value — next lines are list items
         fm[currentKey] = [];
+      } else if (value === "|" || value === ">") {
+        inMultilineString = true;
+        multilineValue = [];
       } else if (value.startsWith("[") && value.endsWith("]")) {
         // Inline array: [a, b, c]
         const inner = value.slice(1, -1).trim();
@@ -118,6 +138,10 @@ function parseFrontmatter(content: string): {
     if (listMatch && currentKey && Array.isArray(fm[currentKey])) {
       fm[currentKey].push(listMatch[1].trim().replace(/^["']|["']$/g, ""));
     }
+  }
+
+  if (inMultilineString && currentKey) {
+    fm[currentKey] = multilineValue.join("\n").trim();
   }
 
   const arrayKeys = ["context", "test_ids", "creates", "tests"];
@@ -191,6 +215,60 @@ async function saveState(cwd: string, state: SpecState, config: ProjectConfig): 
   await fs.writeFile(statePath, JSON.stringify(state, null, 2), "utf8");
 }
 
+async function backupFiles(cwd: string, specId: string, files: string[]) {
+  const snapshotDir = path.join(cwd, ".pi", "spec-snapshots", specId);
+  await fs.mkdir(snapshotDir, { recursive: true });
+  
+  const manifest: Record<string, string | null> = {};
+  const uniqueFiles = Array.from(new Set(files));
+  
+  for (let i = 0; i < uniqueFiles.length; i++) {
+    const file = uniqueFiles[i];
+    const srcPath = path.resolve(cwd, file);
+    try {
+      const content = await fs.readFile(srcPath, "utf8");
+      const backupPath = path.join(snapshotDir, `${i}.txt`);
+      await fs.writeFile(backupPath, content, "utf8");
+      manifest[file] = `${i}.txt`;
+    } catch {
+      manifest[file] = null; // Did not exist
+    }
+  }
+  
+  await fs.writeFile(path.join(snapshotDir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
+}
+
+async function restoreFiles(cwd: string, specId: string) {
+  const snapshotDir = path.join(cwd, ".pi", "spec-snapshots", specId);
+  const manifestPath = path.join(snapshotDir, "manifest.json");
+  
+  let manifest: Record<string, string | null>;
+  try {
+    const raw = await fs.readFile(manifestPath, "utf8");
+    manifest = JSON.parse(raw);
+  } catch {
+    return false; // no backup found
+  }
+  
+  for (const [file, backupName] of Object.entries(manifest)) {
+    const targetPath = path.resolve(cwd, file);
+    if (backupName === null) {
+      await fs.rm(targetPath, { force: true }).catch(() => {});
+    } else {
+      try {
+        const backupPath = path.join(snapshotDir, backupName);
+        const content = await fs.readFile(backupPath, "utf8");
+        await fs.mkdir(path.dirname(targetPath), { recursive: true });
+        await fs.writeFile(targetPath, content, "utf8");
+      } catch (e) {
+        // failed to restore
+      }
+    }
+  }
+  
+  return true;
+}
+
 function buildInstructions(fm: SpecFrontmatter, config: ProjectConfig): string {
   const parts: string[] = [];
 
@@ -210,12 +288,12 @@ function buildInstructions(fm: SpecFrontmatter, config: ProjectConfig): string {
   }
 
   if (fm.test_cmd) {
-    parts.push(`3. **Run tests:** \`${fm.test_cmd}\``);
-    parts.push(`4. If tests **fail**: fix and retry (max ${config.maxRetries} attempts).`);
-    parts.push(`5. If tests **pass**: call \`spec_complete\` with the passing test IDs.`);
+    parts.push(`3. **Run tests:** Call the \`verify_spec\` tool to run \`${fm.test_cmd}\`.`);
+    parts.push(`4. If \`verify_spec\` **fails**: fix the code and call it again (max ${config.maxRetries} attempts).`);
+    parts.push(`5. If \`verify_spec\` **passes**: call \`spec_complete\` with the passing test IDs.`);
     parts.push(`6. If tests fail after ${config.maxRetries} attempts: call \`spec_fail\` with the error.`);
   } else {
-    parts.push(`3. Verify the acceptance criteria, then call \`spec_complete\`.`);
+    parts.push(`3. Call \`verify_spec\` to confirm no tests are required, then call \`spec_complete\`.`);
   }
 
   parts.push("");
@@ -229,6 +307,100 @@ function buildInstructions(fm: SpecFrontmatter, config: ProjectConfig): string {
 // ============================================================
 
 export default function (pi: ExtensionAPI) {
+  pi.on("session_start", async (_event, ctx) => {
+    const config = await loadConfig(ctx.cwd);
+    const state = await loadState(ctx.cwd, config);
+    if (state.current) {
+      ctx.ui.setWidget("spec-dashboard", (tui, theme) => ({
+        render: () => [
+          `🚀 Active Spec: ${theme.fg("accent", state.current!.id)} | Attempt: ${state.current!.attempts + 1}`
+        ],
+        invalidate: () => {}
+      }), { placement: "aboveEditor" });
+    }
+  });
+
+  pi.registerTool({
+    name: "list_specs",
+    label: "List Specs",
+    description: "Scan the specs directory for markdown files, parse their frontmatter, and return a prioritized list of pending and completed specs sorted by phase.",
+    parameters: Type.Object({}),
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const config = await loadConfig(ctx.cwd);
+      const state = await loadState(ctx.cwd, config);
+      
+      const specsDir = path.resolve(ctx.cwd, config.specsDir);
+      let files: string[];
+      try {
+        files = await fs.readdir(specsDir, { recursive: true });
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `❌ Failed to read specs directory (${config.specsDir}): ${err.message}` }],
+          details: {},
+          isError: true,
+        };
+      }
+
+      const mdFiles = files.filter(f => f.endsWith(".md"));
+      const specs: Array<{ file: string, fm: SpecFrontmatter }> = [];
+
+      for (const file of mdFiles) {
+        try {
+          const fullPath = path.join(specsDir, file);
+          const stat = await fs.stat(fullPath);
+          if (!stat.isFile()) continue;
+
+          const content = await fs.readFile(fullPath, "utf8");
+          const { frontmatter } = parseFrontmatter(content);
+          if (frontmatter.id) {
+            specs.push({ file: path.join(config.specsDir, file), fm: frontmatter });
+          }
+        } catch (e) {
+          // ignore files that fail to parse
+        }
+      }
+
+      // Sort by phase (ascending), then ID
+      specs.sort((a, b) => {
+        const phaseA = a.fm.phase ?? 9999;
+        const phaseB = b.fm.phase ?? 9999;
+        if (phaseA !== phaseB) return phaseA - phaseB;
+        return a.fm.id.localeCompare(b.fm.id);
+      });
+
+      const pending: string[] = [];
+      const completed: string[] = [];
+
+      for (const { file, fm } of specs) {
+        const isCompleted = !!state.completed[fm.id];
+        const phaseStr = fm.phase !== undefined ? `[Phase ${fm.phase}]` : `[No Phase]`;
+        const line = `- **${fm.id}** ${phaseStr} ${fm.name} (File: \`${file}\`)`;
+        
+        if (isCompleted) {
+          completed.push(line);
+        } else {
+          pending.push(line);
+        }
+      }
+
+      const lines = ["## Spec Discovery", ""];
+      if (pending.length > 0) {
+        lines.push("### Pending Specs", ...pending, "");
+      } else {
+        lines.push("### Pending Specs", "No pending specs found.", "");
+      }
+
+      if (completed.length > 0) {
+        lines.push("### Completed Specs", ...completed, "");
+      }
+
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: {},
+      };
+    }
+  });
+
   pi.registerTool({
     name: "run_spec",
     label: "Run Spec",
@@ -294,10 +466,17 @@ export default function (pi: ExtensionAPI) {
 
       const prevAttempts = state.failed?.[fm.id]?.attempts || 0;
       
+      if (prevAttempts === 0) {
+        const filesToBackup = [...(fm.context || []), ...(fm.creates || []), ...(fm.tests || [])];
+        await backupFiles(ctx.cwd, fm.id, filesToBackup);
+      }
+
       state.current = {
         id: fm.id,
         attempts: prevAttempts,
         started: new Date().toISOString(),
+        test_cmd: fm.test_cmd,
+        verified: !fm.test_cmd,
       };
       await saveState(ctx.cwd, state, config);
 
@@ -335,11 +514,70 @@ export default function (pi: ExtensionAPI) {
       ].filter(Boolean).join("\n");
 
       ctx.ui.setStatus("spec", `Running: ${fm.id}`);
+      ctx.ui.setWidget("spec-dashboard", (tui, theme) => ({
+        render: () => [
+          `🚀 Active Spec: ${theme.fg("accent", state.current!.id)} | Attempt: ${state.current!.attempts + 1}`
+        ],
+        invalidate: () => {}
+      }), { placement: "aboveEditor" });
 
       return {
         content: [{ type: "text", text: resultText }],
         details: {},
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "verify_spec",
+    label: "Verify Spec",
+    description: "Run the spec's test_cmd to verify your implementation. You must call this and get a passing result before calling spec_complete.",
+    parameters: Type.Object({}),
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const config = await loadConfig(ctx.cwd);
+      const state = await loadState(ctx.cwd, config);
+
+      if (!state.current) {
+        return {
+          content: [{ type: "text", text: "❌ No spec currently running. Use run_spec first." }],
+          details: {},
+          isError: true,
+        };
+      }
+
+      if (!state.current.test_cmd) {
+        state.current.verified = true;
+        await saveState(ctx.cwd, state, config);
+        return {
+          content: [{ type: "text", text: "✅ No test_cmd defined for this spec. You may now call spec_complete." }],
+          details: {},
+        };
+      }
+
+      ctx.ui.setStatus("spec", `Testing: ${state.current.id}`);
+      
+      const bash = createLocalBashOperations();
+      
+      // To intercept output live, we can just execute and await, optionally streaming.
+      // But for simplicity, we just execute and wait for the result.
+      const result = await bash.execute(state.current.test_cmd, { cwd: ctx.cwd }, signal);
+      
+      ctx.ui.setStatus("spec", `Running: ${state.current.id}`);
+
+      if (result.exitCode === 0) {
+        state.current.verified = true;
+        await saveState(ctx.cwd, state, config);
+        return {
+          content: [{ type: "text", text: `✅ Tests passed!\n\nSTDOUT:\n${result.stdout}\n\nYou may now call spec_complete.` }],
+          details: {},
+        };
+      } else {
+        return {
+          content: [{ type: "text", text: `❌ Tests failed (exit code ${result.exitCode}). Fix the code and try verify_spec again.\n\nSTDOUT:\n${result.stdout}\n\nSTDERR:\n${result.stderr}` }],
+          details: {},
+          isError: true,
+        };
+      }
     },
   });
 
@@ -362,6 +600,14 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      if (!state.current.verified) {
+        return {
+          content: [{ type: "text", text: `❌ You must call verify_spec successfully before calling spec_complete.\nIf there is no test_cmd, call verify_spec anyway to confirm.` }],
+          details: {},
+          isError: true,
+        };
+      }
+
       const specId = state.current.id;
       state.completed[specId] = {
         timestamp: new Date().toISOString(),
@@ -378,6 +624,7 @@ export default function (pi: ExtensionAPI) {
       
       ctx.ui.notify(`✅ Spec ${specId} completed!`, "info");
       ctx.ui.setStatus("spec", "Idle");
+      ctx.ui.setWidget("spec-dashboard", undefined);
 
       return {
         content: [{ type: "text", text: `✅ Spec ${specId} completed (${(params.test_ids || []).join(", ")}). Total completed: ${total}.` }],
@@ -417,6 +664,7 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify(`❌ Spec ${specId} failed`, "error");
       ctx.ui.setStatus("spec", "Idle");
+      ctx.ui.setWidget("spec-dashboard", undefined);
 
       return {
         content: [{ type: "text", text: `❌ Spec ${specId} failed: ${params.reason}\nFix the issue, then run the spec again.` }],
@@ -498,10 +746,13 @@ export default function (pi: ExtensionAPI) {
       if (reset) {
         await saveState(ctx.cwd, state, config);
         
+        const restored = await restoreFiles(ctx.cwd, params.id);
+        const restoreMsg = restored ? " Files were restored to their original state." : "";
+        
         ctx.ui.notify(`Spec ${params.id} reset`, "info");
         
         return {
-          content: [{ type: "text", text: `🔄 Spec ${params.id} reset. Run it again with run_spec.` }],
+          content: [{ type: "text", text: `🔄 Spec ${params.id} reset.${restoreMsg} Run it again with run_spec.` }],
           details: {},
         };
       }
