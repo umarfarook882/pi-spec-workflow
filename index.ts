@@ -120,6 +120,13 @@ function parseFrontmatter(content: string): {
     }
   }
 
+  const arrayKeys = ["context", "test_ids", "creates", "tests"];
+  for (const key of arrayKeys) {
+    if (fm[key] !== undefined && !Array.isArray(fm[key])) {
+      fm[key] = [fm[key]];
+    }
+  }
+
   return { frontmatter: fm as SpecFrontmatter, body };
 }
 
@@ -171,7 +178,8 @@ async function loadConfig(cwd: string): Promise<ProjectConfig> {
 async function loadState(cwd: string, config: ProjectConfig): Promise<SpecState> {
   try {
     const raw = await fs.readFile(path.join(cwd, config.stateFile), "utf8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return { completed: {}, ...parsed };
   } catch {
     return { completed: {} };
   }
@@ -256,6 +264,14 @@ export default function (pi: ExtensionAPI) {
       
       const { frontmatter: fm, body } = parsed;
 
+      if (!fm.id) {
+        return {
+          content: [{ type: "text", text: `❌ Spec must have an 'id' field in the frontmatter.` }],
+          details: {},
+          isError: true,
+        };
+      }
+
       if (state.completed[fm.id]) {
         const c = state.completed[fm.id];
         return {
@@ -332,7 +348,7 @@ export default function (pi: ExtensionAPI) {
     label: "Spec Complete",
     description: "Mark the current spec as completed. Call this after all tests pass. Persists state for cross-session tracking.",
     parameters: Type.Object({
-      test_ids: Type.Array(Type.String(), { description: "Test IDs that are now passing (or empty for specs without tests)" }),
+      test_ids: Type.Optional(Type.Array(Type.String(), { description: "Test IDs that are now passing (or empty for specs without tests)" })),
     }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const config = await loadConfig(ctx.cwd);
@@ -431,9 +447,9 @@ export default function (pi: ExtensionAPI) {
 
       if (completed.length > 0) {
         lines.push("### Completed Specs");
-        for (const [id, info] of completed.sort()) {
+        for (const [id, info] of completed.sort((a, b) => a[0].localeCompare(b[0]))) {
           lines.push(
-            `✅ ${id} — tests: ${info.test_ids.join(",")} (${info.timestamp.split("T")[0]}, ${info.attempts} attempt${info.attempts > 1 ? "s" : ""})`
+            `✅ ${id} — tests: ${(info.test_ids || []).join(",")} (${info.timestamp.split("T")[0]}, ${info.attempts} attempt${info.attempts > 1 ? "s" : ""})`
           );
         }
         lines.push("");
@@ -441,7 +457,7 @@ export default function (pi: ExtensionAPI) {
 
       if (failed.length > 0) {
         lines.push("### Failed Specs");
-        for (const [id, info] of failed.sort()) {
+        for (const [id, info] of failed.sort((a, b) => a[0].localeCompare(b[0]))) {
           lines.push(
             `❌ ${id} — ${info.last_reason} (${info.timestamp.split("T")[0]}, ${info.attempts} attempt${info.attempts > 1 ? "s" : ""})`
           );
