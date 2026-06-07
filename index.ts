@@ -31,6 +31,7 @@ interface SpecState {
     timestamp: string;
     test_ids: string[];
     attempts: number;
+    commit_sha?: string;
   }>;
   failed?: Record<string, {
     timestamp: string;
@@ -339,6 +340,85 @@ function buildInstructions(fm: SpecFrontmatter, config: ProjectConfig): string {
 // ============================================================
 // Extension
 // ============================================================
+
+async function executeGitWithAudit(
+  ctx: any, bash: any, specId: string, cmd: string, 
+  promptTitle: string, promptMsg: string, signal: AbortSignal | undefined
+): Promise<string | null> {
+  let isGit = false;
+  try {
+    const res = await bash.exec("git rev-parse --is-inside-work-tree", ctx.cwd, { onData: () => {}, signal });
+    isGit = res.exitCode === 0;
+  } catch (e) { return null; }
+  
+  if (!isGit) return null;
+
+  // Ask for confirmation or edit
+  const actionStr = await ctx.ui.select(promptTitle, [
+    { label: "Approve", value: "approve" },
+    { label: "Edit Command", value: "edit" },
+    { label: "Reject", value: "reject" }
+  ], promptMsg + `\n\nCommand: ${cmd}`);
+
+  if (!actionStr || actionStr === "reject") {
+    let auditLog = `[${new Date().toISOString()}] SPEC: ${specId}\nCMD: ${cmd}\nSTATUS: REJECTED\n---\n`;
+    try {
+      const piDir = path.resolve(ctx.cwd, ".pi");
+      await fs.mkdir(piDir, { recursive: true });
+      await fs.appendFile(path.resolve(piDir, "git-audit.log"), auditLog);
+    } catch (e) {}
+    return null;
+  }
+
+  let finalCmd = cmd;
+  if (actionStr === "edit") {
+    const editedCmd = await ctx.ui.input("Edit Git Command", finalCmd);
+    if (!editedCmd) {
+      let auditLog = `[${new Date().toISOString()}] SPEC: ${specId}\nCMD: ${cmd}\nSTATUS: REJECTED (Empty Edit)\n---\n`;
+      try {
+        const piDir = path.resolve(ctx.cwd, ".pi");
+        await fs.appendFile(path.resolve(piDir, "git-audit.log"), auditLog);
+      } catch (e) {}
+      return null;
+    }
+    finalCmd = editedCmd;
+  }
+
+  let auditLog = `[${new Date().toISOString()}] SPEC: ${specId}\nCMD: ${finalCmd}\nSTATUS: APPROVED${actionStr === "edit" ? " (EDITED)" : ""}\n`;
+  let output = "";
+
+  try {
+    await bash.exec(finalCmd, ctx.cwd, {
+      onData: (d: any) => { output += d.toString(); },
+      signal
+    });
+    auditLog += `OUTPUT:\n${output}\n`;
+    ctx.ui.notify(`Git action successful`, "info");
+  } catch (e: any) {
+    auditLog += `ERROR: ${e.message}\n`;
+    ctx.ui.notify(`Git action failed`, "error");
+  }
+
+  try {
+    const piDir = path.resolve(ctx.cwd, ".pi");
+    await fs.mkdir(piDir, { recursive: true });
+    await fs.appendFile(path.resolve(piDir, "git-audit.log"), auditLog + "---\n");
+  } catch (e) {}
+
+  return output;
+}
+
+// Helper to log non-interactive, read-only or background git operations to the audit log
+async function logGitAction(ctx: any, specId: string, cmd: string, output: string, error?: string) {
+  try {
+    let auditLog = `[${new Date().toISOString()}] SPEC: ${specId}\nCMD: ${cmd}\nSTATUS: BACKGROUND_TASK\nOUTPUT:\n${output}\n`;
+    if (error) auditLog += `ERROR: ${error}\n`;
+    
+    const piDir = path.resolve(ctx.cwd, ".pi");
+    await fs.mkdir(piDir, { recursive: true });
+    await fs.appendFile(path.resolve(piDir, "git-audit.log"), auditLog + "---\n");
+  } catch (e) {}
+}
 
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
@@ -746,10 +826,40 @@ export default function (pi: ExtensionAPI) {
       }
 
       const specId = state.current.id;
+
+      const bash = createLocalBashOperations();
+      
+      let isDirty = false;
+      try {
+        let statusOut = "";
+        const sRes = await bash.exec("git status --porcelain", ctx.cwd, {
+          onData: (d) => { statusOut += d.toString(); }, signal
+        });
+        isDirty = sRes.exitCode === 0 && statusOut.trim().length > 0;
+      } catch (e) {}
+
+      let commitSha: string | undefined;
+      if (isDirty) {
+        const cmd = `git add . && git commit -m "spec: complete ${specId}"`;
+        const approved = await executeGitWithAudit(
+          ctx, bash, specId, cmd, 
+          "Git Commit", `Spec ${specId} passed tests.\nCommit the code?`, signal
+        );
+        
+        if (approved !== null) {
+          try {
+            let shaOut = "";
+            await bash.exec("git rev-parse HEAD", ctx.cwd, { onData: (d) => shaOut += d.toString(), signal });
+            commitSha = shaOut.trim();
+          } catch(e) {}
+        }
+      }
+
       state.completed[specId] = {
         timestamp: new Date().toISOString(),
         test_ids: params.test_ids || [],
         attempts: state.current.attempts + 1,
+        commit_sha: commitSha
       };
       if (state.failed && state.failed[specId]) {
         delete state.failed[specId];
@@ -790,6 +900,65 @@ export default function (pi: ExtensionAPI) {
       }
 
       const specId = state.current.id;
+
+      // ============================================================
+      // Git Feature: Create patch file before reset
+      // ============================================================
+      const bash = createLocalBashOperations();
+      
+      let isDirty = false;
+      try {
+        let statusOut = "";
+        const sRes = await bash.exec("git status --porcelain", ctx.cwd, {
+          onData: (d) => { statusOut += d.toString(); }, signal
+        });
+        isDirty = sRes.exitCode === 0 && statusOut.trim().length > 0;
+      } catch (e) {}
+
+      let patchFile = "";
+      if (isDirty) {
+        let patchData = "";
+        let errorData = "";
+        try {
+          const piPatchesDir = path.resolve(ctx.cwd, ".pi", "patches");
+          await fs.mkdir(piPatchesDir, { recursive: true });
+          
+          const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+          patchFile = path.join(".pi", "patches", `${specId}-failed-${timestamp}.patch`);
+          
+          // Stage everything (to capture untracked files)
+          await bash.exec("git add .", ctx.cwd, { onData: () => {}, signal });
+          
+          // Generate patch
+          await bash.exec("git diff --staged", ctx.cwd, {
+            onData: (d) => { patchData += d.toString(); }, signal
+          });
+          
+          // Unstage to leave workspace exactly as we found it
+          await bash.exec("git reset", ctx.cwd, { onData: () => {}, signal });
+          
+          if (patchData.trim()) {
+            await fs.writeFile(path.resolve(ctx.cwd, patchFile), patchData);
+            await logGitAction(ctx, specId, `git diff --staged > ${patchFile}`, patchData);
+          } else {
+            patchFile = ""; // Diff was empty
+          }
+        } catch (e: any) {
+          errorData = e.message;
+          patchFile = ""; // Gracefully fail if patch generation errors
+          await logGitAction(ctx, specId, `Generate Patch`, patchData, errorData);
+        }
+      }
+
+      const cmd = "git reset --hard && git clean -fd";
+      const patchMsg = patchFile ? `\n\nA patch of the failed changes was saved to:\n${patchFile}` : "";
+      
+      await executeGitWithAudit(
+        ctx, bash, specId, cmd,
+        "Git Reset", `Spec ${specId} failed. Discard uncommitted AI changes?${patchMsg}`, signal
+      );
+      // ============================================================
+
       if (!state.failed) state.failed = {};
       state.failed[specId] = {
         timestamp: new Date().toISOString(),
@@ -869,6 +1038,28 @@ export default function (pi: ExtensionAPI) {
       const state = await loadState(ctx.cwd, config);
 
       let reset = false;
+      const completedInfo = state.completed[params.id];
+
+      const bash = createLocalBashOperations();
+      if (completedInfo?.commit_sha) {
+        let isHead = false;
+        try {
+          let headSha = "";
+          await bash.exec("git rev-parse HEAD", ctx.cwd, { onData: (d) => headSha += d.toString(), signal });
+          isHead = headSha.trim() === completedInfo.commit_sha;
+        } catch(e) {}
+
+        const cmd = isHead 
+          ? "git reset --hard HEAD~1 && git clean -fd" 
+          : `git revert ${completedInfo.commit_sha} --no-edit`;
+        
+        const actionStr = isHead ? "Hard Reset (removes commit)" : "Revert (creates undo commit)";
+        
+        await executeGitWithAudit(
+          ctx, bash, params.id, cmd,
+          "Git Rollback", `Resetting spec ${params.id}.\nDo you want to ${actionStr}?`, signal
+        );
+      }
 
       if (state.completed[params.id]) {
         delete state.completed[params.id];
