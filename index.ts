@@ -321,10 +321,10 @@ function buildInstructions(fm: SpecFrontmatter, config: ProjectConfig): string {
   if (fm.test_cmd) {
     parts.push(`3. **Run tests:** Call the \`verify_spec\` tool to run \`${fm.test_cmd}\`.`);
     parts.push(`4. If \`verify_spec\` **fails**: fix the code and call it again (max ${config.maxRetries} attempts).`);
-    parts.push(`5. If \`verify_spec\` **passes**: call \`spec_complete\` with the passing test IDs.`);
+    parts.push(`5. If \`verify_spec\` **passes**: call \`git_commit\` to commit your changes (include spec ID in message), then call \`spec_complete\` with the passing test IDs.`);
     parts.push(`6. If tests fail after ${config.maxRetries} attempts: call \`spec_fail\` with the error.`);
   } else {
-    parts.push(`3. Call \`verify_spec\` to confirm no tests are required, then call \`spec_complete\`.`);
+    parts.push(`3. Call \`verify_spec\` to confirm no tests are required, then call \`git_commit\`, and finally call \`spec_complete\`.`);
   }
 
   const rules = config.rules && config.rules.length > 0 
@@ -609,6 +609,85 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "git_commit",
+    label: "Git Commit",
+    description: "Commit the current git changes. Use this after verifying your spec implementation to checkpoint your work.",
+    parameters: Type.Object({
+      message: Type.String({ description: "Semantic commit message describing the changes. MUST include active Spec ID if applicable (e.g. 'feat(api-01): add auth')" }),
+    }),
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const config = await loadConfig(ctx.cwd);
+      const state = await loadState(ctx.cwd, config);
+      const specId = state.current?.id || "manual-commit";
+      const bash = createLocalBashOperations();
+      
+      let statusOut = "";
+      try {
+        await bash.exec("git status --porcelain", ctx.cwd, { onData: (d) => statusOut += d.toString(), signal });
+      } catch (e) {}
+
+      if (!statusOut.trim()) {
+        return { content: [{ type: "text", text: "No changes to commit." }], details: {} };
+      }
+
+      const cmd = `git add . && git commit -m ${JSON.stringify(params.message)}`;
+      const output = await executeGitWithAudit(
+        ctx, bash, specId, cmd,
+        "Git Commit", `Agent proposes commit:\nMessage: ${params.message}`, signal
+      );
+
+      if (output !== null) {
+        return { content: [{ type: "text", text: `Changes committed successfully.\n${output}` }], details: {} };
+      } else {
+        return { content: [{ type: "text", text: "Commit rejected by user." }], details: {}, isError: true };
+      }
+    }
+  });
+
+  pi.registerTool({
+    name: "git_patch",
+    label: "Git Patch",
+    description: "Save current changes to a patch file. Use this to stash progress or save an experimental attempt.",
+    parameters: Type.Object({
+      filename: Type.String({ description: "Short descriptive filename for the patch (without .patch extension). Include Spec ID if applicable." }),
+      reset_after: Type.Boolean({ description: "Whether to hard reset the workspace after saving the patch" })
+    }),
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const config = await loadConfig(ctx.cwd);
+      const state = await loadState(ctx.cwd, config);
+      const specId = state.current?.id || "manual-patch";
+      const bash = createLocalBashOperations();
+      
+      const filename = `${params.filename}.patch`;
+      const patchPath = path.join(".pi", "patches", filename);
+      
+      let statusOut = "";
+      try {
+        await bash.exec("git status --porcelain", ctx.cwd, { onData: (d) => statusOut += d.toString(), signal });
+      } catch (e) {}
+
+      if (!statusOut.trim()) {
+        return { content: [{ type: "text", text: "No changes to patch." }], details: {} };
+      }
+
+      const cmd = params.reset_after 
+        ? `git add . && git diff --staged > ${patchPath} && git reset --hard && git clean -fd`
+        : `git add . && git diff --staged > ${patchPath} && git reset`;
+
+      const output = await executeGitWithAudit(
+        ctx, bash, specId, cmd,
+        "Git Patch", `Agent proposes creating patch: ${patchPath}\nReset after: ${params.reset_after ? "Yes" : "No"}`, signal
+      );
+
+      if (output !== null) {
+        return { content: [{ type: "text", text: `Patch saved to ${patchPath}` }], details: {} };
+      } else {
+        return { content: [{ type: "text", text: "Patch creation rejected by user." }], details: {}, isError: true };
+      }
+    }
+  });
+
+  pi.registerTool({
     name: "run_spec",
     label: "Run Spec",
     description: "Load and run a spec file. Parses frontmatter, loads only the declared context files, presents requirements with TDD instructions. The model then implements, tests, and calls spec_complete or spec_fail.",
@@ -841,25 +920,24 @@ export default function (pi: ExtensionAPI) {
       let commitSha: string | undefined;
       if (isDirty) {
         const cmd = `git add . && git commit -m "spec: complete ${specId}"`;
-        const approved = await executeGitWithAudit(
+        await executeGitWithAudit(
           ctx, bash, specId, cmd, 
-          "Git Commit", `Spec ${specId} passed tests.\nCommit the code?`, signal
+          "Git Commit", `Spec ${specId} has uncommitted changes.\nCommit the code?`, signal
         );
-        
-        if (approved !== null) {
-          try {
-            let shaOut = "";
-            await bash.exec("git rev-parse HEAD", ctx.cwd, { onData: (d) => shaOut += d.toString(), signal });
-            commitSha = shaOut.trim();
-          } catch(e) {}
-        }
       }
+
+      let commitShaVal: string | undefined;
+      try {
+        let shaOut = "";
+        await bash.exec("git rev-parse HEAD", ctx.cwd, { onData: (d) => shaOut += d.toString(), signal });
+        commitShaVal = shaOut.trim();
+      } catch(e) {}
 
       state.completed[specId] = {
         timestamp: new Date().toISOString(),
         test_ids: params.test_ids || [],
         attempts: state.current.attempts + 1,
-        commit_sha: commitSha
+        commit_sha: commitShaVal
       };
       if (state.failed && state.failed[specId]) {
         delete state.failed[specId];
