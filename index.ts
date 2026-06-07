@@ -435,6 +435,48 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  pi.registerCommand("commit", {
+    description: "Commit the current git changes",
+    handler: async (args, ctx) => {
+      const bash = createLocalBashOperations();
+      const config = await loadConfig(ctx.cwd);
+      const state = await loadState(ctx.cwd, config);
+      const specId = state.current?.id;
+
+      let statusOut = "";
+      try {
+        await bash.exec("git status --porcelain", ctx.cwd, { onData: (d) => statusOut += d.toString() });
+      } catch (e) {}
+
+      if (!statusOut.trim()) {
+        ctx.ui.notify("No changes to commit", "info");
+        return;
+      }
+
+      ctx.ui.setEditorText(`Generate a semantic commit message for the current git diff. ${specId ? `The scope MUST be ${specId} (e.g. feat(${specId}): ...)` : "Do not include a scope."}\nCall the git_commit tool with the message.`);
+      ctx.ui.notify("Draft prompt placed in editor. Press Enter to generate commit.", "info");
+    }
+  });
+
+  pi.registerCommand("patch", {
+    description: "Save current changes to a patch file",
+    handler: async (args, ctx) => {
+      const bash = createLocalBashOperations();
+      let statusOut = "";
+      try {
+        await bash.exec("git status --porcelain", ctx.cwd, { onData: (d) => statusOut += d.toString() });
+      } catch (e) {}
+
+      if (!statusOut.trim()) {
+        ctx.ui.notify("No changes to patch", "info");
+        return;
+      }
+
+      ctx.ui.setEditorText(`Look at the current git diff and call the git_patch tool to stash my work. Generate a descriptive filename.`);
+      ctx.ui.notify("Draft prompt placed in editor. Press Enter to generate patch.", "info");
+    }
+  });
+
   pi.registerTool({
     name: "create_spec",
     label: "Create Spec",
