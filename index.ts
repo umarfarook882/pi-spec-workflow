@@ -50,6 +50,8 @@ interface ProjectConfig {
   maxRetries: number;       // default 3
   specsDir: string;         // default "specs/"
   stateFile: string;        // default ".pi/spec-state.json"
+  rules?: string[];         // custom TDD rules
+  testTimeout?: number;     // timeout in ms for test_cmd
 }
 
 // ============================================================
@@ -60,6 +62,11 @@ const DEFAULT_CONFIG: ProjectConfig = {
   maxRetries: 3,
   specsDir: "specs/",
   stateFile: ".pi/spec-state.json",
+  rules: [
+    "Complete one file at a time.",
+    "Read existing files before editing to understand context."
+  ],
+  testTimeout: 60000,
 };
 
 // ============================================================
@@ -89,6 +96,29 @@ function parseFrontmatter(content: string): {
   let inMultilineString = false;
   let multilineValue: string[] = [];
 
+  function parseInlineArray(inner: string): string[] {
+    const result: string[] = [];
+    let current = "";
+    let inQuote: string | null = null;
+    for (let i = 0; i < inner.length; i++) {
+      const char = inner[i];
+      if ((char === '"' || char === "'") && (i === 0 || inner[i - 1] !== '\\')) {
+        if (inQuote === char) inQuote = null;
+        else if (!inQuote) inQuote = char;
+        current += char;
+      } else if (char === ',' && !inQuote) {
+        result.push(current.trim().replace(/^["']|["']$/g, ""));
+        current = "";
+      } else {
+        current += char;
+      }
+    }
+    if (current.trim()) {
+      result.push(current.trim().replace(/^["']|["']$/g, ""));
+    }
+    return result;
+  }
+
   for (const line of yaml.split("\n")) {
     const trimmed = line.trim();
 
@@ -114,15 +144,13 @@ function parseFrontmatter(content: string): {
       if (!value) {
         // Key with no inline value — next lines are list items
         fm[currentKey] = [];
-      } else if (value === "|" || value === ">") {
+      } else if (/^[|>][+-]?\d*$/.test(value)) {
         inMultilineString = true;
         multilineValue = [];
       } else if (value.startsWith("[") && value.endsWith("]")) {
         // Inline array: [a, b, c]
         const inner = value.slice(1, -1).trim();
-        fm[currentKey] = inner
-          ? inner.split(",").map((s) => s.trim().replace(/^["']|["']$/g, ""))
-          : [];
+        fm[currentKey] = inner ? parseInlineArray(inner) : [];
       } else if (value === "true" || value === "false") {
         fm[currentKey] = value === "true";
       } else if (/^\d+$/.test(value)) {
@@ -173,14 +201,8 @@ async function resolveContext(cwd: string, files: string[]): Promise<string> {
   for (const filePath of files) {
     const result = await loadFile(cwd, filePath);
     if (result.found) {
-      const isSource = /\.(rs|py|ts|js|go|java|c|cpp|h|toml|yaml|yml|json)$/.test(filePath);
-      const lang = filePath.split(".").pop() || "text";
-
-      if (isSource) {
-        sections.push(`### Source: \`${filePath}\`\n\`\`\`${lang}\n${result.content}\n\`\`\``);
-      } else {
-        sections.push(`### Context: \`${filePath}\`\n${result.content}`);
-      }
+      const ext = filePath.split(".").pop() || "text";
+      sections.push(`### File: \`${filePath}\`\n\`\`\`${ext}\n${result.content}\n\`\`\``);
     } else {
       sections.push(result.content);
     }
@@ -296,8 +318,12 @@ function buildInstructions(fm: SpecFrontmatter, config: ProjectConfig): string {
     parts.push(`3. Call \`verify_spec\` to confirm no tests are required, then call \`spec_complete\`.`);
   }
 
+  const rules = config.rules && config.rules.length > 0 
+    ? config.rules 
+    : ["Complete one file at a time.", "Read existing files before editing."];
+
   parts.push("");
-  parts.push("**Rules:** One file at a time. Read existing files before editing. No .unwrap() in Rust. Type hints in Python.");
+  parts.push("**Rules:** " + rules.join(" "));
 
   return parts.join("\n");
 }
@@ -312,9 +338,10 @@ export default function (pi: ExtensionAPI) {
     const state = await loadState(ctx.cwd, config);
     if (state.current) {
       ctx.ui.setWidget("spec-dashboard", (tui, theme) => ({
-        render: () => [
-          `🚀 Active Spec: ${theme.fg("accent", state.current!.id)} | Attempt: ${state.current!.attempts + 1}`
-        ],
+        render: () => {
+          if (!state.current) return ["🚀 Spec Workflow: Idle"];
+          return [`🚀 Active Spec: ${theme.fg("accent", state.current.id)} | Attempt: ${state.current.attempts + 1}`];
+        },
         invalidate: () => {}
       }), { placement: "aboveEditor" });
     }
@@ -343,6 +370,7 @@ export default function (pi: ExtensionAPI) {
 
       const mdFiles = files.filter(f => f.endsWith(".md"));
       const specs: Array<{ file: string, fm: SpecFrontmatter }> = [];
+      const invalidSpecs: Array<{ file: string, error: string }> = [];
 
       for (const file of mdFiles) {
         try {
@@ -354,9 +382,11 @@ export default function (pi: ExtensionAPI) {
           const { frontmatter } = parseFrontmatter(content);
           if (frontmatter.id) {
             specs.push({ file: path.join(config.specsDir, file), fm: frontmatter });
+          } else {
+            invalidSpecs.push({ file: path.join(config.specsDir, file), error: "Missing 'id' field in frontmatter" });
           }
-        } catch (e) {
-          // ignore files that fail to parse
+        } catch (e: any) {
+          invalidSpecs.push({ file: path.join(config.specsDir, file), error: e.message });
         }
       }
 
@@ -392,6 +422,14 @@ export default function (pi: ExtensionAPI) {
 
       if (completed.length > 0) {
         lines.push("### Completed Specs", ...completed, "");
+      }
+
+      if (invalidSpecs.length > 0) {
+        lines.push("### ⚠️ Invalid Specs", "These files failed to parse and are ignored:", "");
+        for (const inv of invalidSpecs) {
+          lines.push(`- \`${inv.file}\`: ${inv.error}`);
+        }
+        lines.push("");
       }
 
       return {
@@ -515,9 +553,10 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.setStatus("spec", `Running: ${fm.id}`);
       ctx.ui.setWidget("spec-dashboard", (tui, theme) => ({
-        render: () => [
-          `🚀 Active Spec: ${theme.fg("accent", state.current!.id)} | Attempt: ${state.current!.attempts + 1}`
-        ],
+        render: () => {
+          if (!state.current) return ["🚀 Spec Workflow: Idle"];
+          return [`🚀 Active Spec: ${theme.fg("accent", state.current.id)} | Attempt: ${state.current.attempts + 1}`];
+        },
         invalidate: () => {}
       }), { placement: "aboveEditor" });
 
@@ -557,23 +596,32 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("spec", `Testing: ${state.current.id}`);
       
       const bash = createLocalBashOperations();
+      let output = "";
       
-      // To intercept output live, we can just execute and await, optionally streaming.
-      // But for simplicity, we just execute and wait for the result.
-      const result = await bash.execute(state.current.test_cmd, { cwd: ctx.cwd }, signal);
+      let exitCode: number | null = null;
+      try {
+        const result = await bash.exec(state.current.test_cmd, ctx.cwd, {
+          onData: (data) => { output += data.toString(); },
+          signal,
+          timeout: config.testTimeout || 60000
+        });
+        exitCode = result.exitCode;
+      } catch (e: any) {
+        output += `\nError executing command: ${e.message}`;
+      }
       
       ctx.ui.setStatus("spec", `Running: ${state.current.id}`);
 
-      if (result.exitCode === 0) {
+      if (exitCode === 0) {
         state.current.verified = true;
         await saveState(ctx.cwd, state, config);
         return {
-          content: [{ type: "text", text: `✅ Tests passed!\n\nSTDOUT:\n${result.stdout}\n\nYou may now call spec_complete.` }],
+          content: [{ type: "text", text: `✅ Tests passed!\n\nOUTPUT:\n${output}\n\nYou may now call spec_complete.` }],
           details: {},
         };
       } else {
         return {
-          content: [{ type: "text", text: `❌ Tests failed (exit code ${result.exitCode}). Fix the code and try verify_spec again.\n\nSTDOUT:\n${result.stdout}\n\nSTDERR:\n${result.stderr}` }],
+          content: [{ type: "text", text: `❌ Tests failed (exit code ${exitCode}). Fix the code and try verify_spec again.\n\nOUTPUT:\n${output}` }],
           details: {},
           isError: true,
         };
