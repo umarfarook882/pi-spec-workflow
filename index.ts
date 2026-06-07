@@ -52,6 +52,10 @@ interface ProjectConfig {
   stateFile: string;        // default ".pi/spec-state.json"
   rules?: string[];         // custom TDD rules
   testTimeout?: number;     // timeout in ms for test_cmd
+  tokenLimits?: {           // thresholds for token weight warnings
+    medium: number;         // default 250
+    heavy: number;          // default 750
+  };
 }
 
 // ============================================================
@@ -67,6 +71,10 @@ const DEFAULT_CONFIG: ProjectConfig = {
     "Read existing files before editing to understand context."
   ],
   testTimeout: 60000,
+  tokenLimits: {
+    medium: 250,
+    heavy: 750
+  }
 };
 
 // ============================================================
@@ -348,6 +356,79 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "create_spec",
+    label: "Create Spec",
+    description: "Scaffold a new spec file. Distills requirements into concise acceptance criteria to minimize token usage.",
+    parameters: Type.Object({
+      id: Type.String({ description: "Unique Spec ID (e.g. 'auth-01')" }),
+      name: Type.String({ description: "Short human-readable name" }),
+      requirements: Type.String({ description: "The concise requirements or acceptance criteria (Markdown body). Do not include large code blocks; reference them in context files instead." }),
+      phase: Type.Optional(Type.Number({ description: "Execution phase (lower runs first)" })),
+      context: Type.Optional(Type.Array(Type.String(), { description: "Existing files to load as context" })),
+      test_ids: Type.Optional(Type.Array(Type.String(), { description: "Test IDs to implement" })),
+      test_cmd: Type.Optional(Type.String({ description: "Command to verify the spec" })),
+      creates: Type.Optional(Type.Array(Type.String(), { description: "Files this spec is expected to create" })),
+      tests: Type.Optional(Type.Array(Type.String(), { description: "Test files to modify/create" }))
+    }),
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const config = await loadConfig(ctx.cwd);
+      const specsDir = path.resolve(ctx.cwd, config.specsDir);
+      
+      await fs.mkdir(specsDir, { recursive: true });
+      
+      const filePath = path.join(specsDir, `${params.id}.md`);
+      
+      const fm: string[] = ["---"];
+      fm.push(`id: ${params.id}`);
+      fm.push(`name: "${params.name.replace(/"/g, '\\"')}"`);
+      if (params.phase !== undefined) fm.push(`phase: ${params.phase}`);
+      
+      const formatArray = (key: string, arr?: string[]) => {
+        if (arr && arr.length > 0) {
+          fm.push(`${key}:`);
+          arr.forEach(item => fm.push(`  - "${item.replace(/"/g, '\\"')}"`));
+        }
+      };
+      
+      formatArray("context", params.context);
+      formatArray("test_ids", params.test_ids);
+      
+      if (params.test_cmd) {
+        if (params.test_cmd.includes("\n")) {
+          fm.push(`test_cmd: |-`);
+          params.test_cmd.split("\n").forEach(line => fm.push(`  ${line}`));
+        } else {
+          fm.push(`test_cmd: "${params.test_cmd.replace(/"/g, '\\"')}"`);
+        }
+      }
+      
+      formatArray("creates", params.creates);
+      formatArray("tests", params.tests);
+      fm.push("---");
+      fm.push("");
+      fm.push(params.requirements);
+      fm.push("");
+      
+      const content = fm.join("\n");
+      await fs.writeFile(filePath, content, "utf8");
+      
+      const tokens = Math.ceil(params.requirements.length / 4);
+      let weightStr = "";
+      const limitMedium = config.tokenLimits?.medium || 250;
+      const limitHeavy = config.tokenLimits?.heavy || 750;
+      
+      if (tokens < limitMedium) weightStr = `🟢 Light (~${tokens} tokens)`;
+      else if (tokens <= limitHeavy) weightStr = `🟡 Medium (~${tokens} tokens)`;
+      else weightStr = `🔴 Heavy (~${tokens} tokens). Consider moving code blocks to context files!`;
+      
+      return {
+        content: [{ type: "text", text: `✅ Spec created at \`${path.relative(ctx.cwd, filePath)}\`\n\n**Token Weight:** ${weightStr}` }],
+        details: {},
+      };
+    }
+  });
+
+  pi.registerTool({
     name: "list_specs",
     label: "List Specs",
     description: "Scan the specs directory for markdown files, parse their frontmatter, and return a prioritized list of pending and completed specs sorted by phase.",
@@ -369,7 +450,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const mdFiles = files.filter(f => f.endsWith(".md"));
-      const specs: Array<{ file: string, fm: SpecFrontmatter }> = [];
+      const specs: Array<{ file: string, fm: SpecFrontmatter, weight: string }> = [];
       const invalidSpecs: Array<{ file: string, error: string }> = [];
 
       for (const file of mdFiles) {
@@ -379,9 +460,17 @@ export default function (pi: ExtensionAPI) {
           if (!stat.isFile()) continue;
 
           const content = await fs.readFile(fullPath, "utf8");
-          const { frontmatter } = parseFrontmatter(content);
+          const { frontmatter, body } = parseFrontmatter(content);
           if (frontmatter.id) {
-            specs.push({ file: path.join(config.specsDir, file), fm: frontmatter });
+            const tokens = Math.ceil(body.length / 4);
+            let weightStr = "";
+            const limitMedium = config.tokenLimits?.medium || 250;
+            const limitHeavy = config.tokenLimits?.heavy || 750;
+            
+            if (tokens < limitMedium) weightStr = `🟢 ~${tokens}t`;
+            else if (tokens <= limitHeavy) weightStr = `🟡 ~${tokens}t`;
+            else weightStr = `🔴 ~${tokens}t`;
+            specs.push({ file: path.join(config.specsDir, file), fm: frontmatter, weight: weightStr });
           } else {
             invalidSpecs.push({ file: path.join(config.specsDir, file), error: "Missing 'id' field in frontmatter" });
           }
@@ -401,10 +490,10 @@ export default function (pi: ExtensionAPI) {
       const pending: string[] = [];
       const completed: string[] = [];
 
-      for (const { file, fm } of specs) {
+      for (const { file, fm, weight } of specs) {
         const isCompleted = !!state.completed[fm.id];
         const phaseStr = fm.phase !== undefined ? `[Phase ${fm.phase}]` : `[No Phase]`;
-        const line = `- **${fm.id}** ${phaseStr} ${fm.name} (File: \`${file}\`)`;
+        const line = `- **${fm.id}** ${phaseStr} ${fm.name} (${weight}) (File: \`${file}\`)`;
         
         if (isCompleted) {
           completed.push(line);
