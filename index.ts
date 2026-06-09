@@ -57,6 +57,8 @@ interface ProjectConfig {
     medium: number;         // default 250
     heavy: number;          // default 750
   };
+  interactiveContext?: boolean; // Show UI prompts for large files (default true)
+  largeFileThreshold?: number;  // Lines threshold for interactive prompts (default 1000)
 }
 
 // ============================================================
@@ -75,7 +77,9 @@ const DEFAULT_CONFIG: ProjectConfig = {
   tokenLimits: {
     medium: 250,
     heavy: 750
-  }
+  },
+  interactiveContext: true,
+  largeFileThreshold: 1000
 };
 
 // ============================================================
@@ -173,7 +177,18 @@ function parseFrontmatter(content: string): {
     // List item: - value
     const listMatch = trimmed.match(/^-\s+(.+)$/);
     if (listMatch && currentKey && Array.isArray(fm[currentKey])) {
-      fm[currentKey].push(listMatch[1].trim().replace(/^["']|["']$/g, ""));
+      let val: any = listMatch[1].trim();
+      if ((val.startsWith("{") && val.endsWith("}")) || (val.startsWith("'") && val.endsWith("'"))) {
+        let cleanVal = val.replace(/^'|'$/g, "");
+        if (cleanVal.startsWith("{") && cleanVal.endsWith("}")) {
+          try { val = JSON.parse(cleanVal); } catch (e) { val = listMatch[1].trim().replace(/^["']|["']$/g, ""); }
+        } else {
+          val = listMatch[1].trim().replace(/^["']|["']$/g, "");
+        }
+      } else {
+        val = val.replace(/^["']|["']$/g, "");
+      }
+      fm[currentKey].push(val);
     }
   }
 
@@ -191,17 +206,17 @@ function parseFrontmatter(content: string): {
   return { frontmatter: fm as SpecFrontmatter, body };
 }
 
+async function logContextAudit(cwd: string, text: string) {
+  try {
+    const piDir = path.resolve(cwd, ".pi");
+    await fs.mkdir(piDir, { recursive: true });
+    await fs.appendFile(path.resolve(piDir, "context-audit.log"), text + "\n---\n");
+  } catch (e) {}
+}
+
 async function loadFile(cwd: string, filePath: string): Promise<{ path: string; content: string; found: boolean }> {
   try {
     const content = await fs.readFile(path.resolve(cwd, filePath), "utf8");
-    const lines = content.split("\n");
-    if (lines.length > 2000) {
-      return { 
-        path: filePath, 
-        content: "[...TRUNCATED FIRST PORTION...]\n" + lines.slice(-2000).join("\n") + "\n\n/* ⚠️ File exceeded 2000 lines. Showing last 2000 lines. Use the `read` tool to view specific regions if needed. */", 
-        found: true 
-      };
-    }
     return { path: filePath, content, found: true };
   } catch {
     return {
@@ -212,17 +227,105 @@ async function loadFile(cwd: string, filePath: string): Promise<{ path: string; 
   }
 }
 
-async function resolveContext(cwd: string, files: string[]): Promise<string> {
+async function resolveContext(ctx: ExtensionContext, config: ProjectConfig, specId: string, files: any[]): Promise<string> {
   const sections: string[] = [];
+  const threshold = config.largeFileThreshold || 1000;
 
-  for (const filePath of files) {
-    const result = await loadFile(cwd, filePath);
-    if (result.found) {
-      const ext = filePath.split(".").pop() || "text";
-      sections.push(`### File: \`${filePath}\`\n\`\`\`${ext}\n${result.content}\n\`\`\``);
-    } else {
+  for (const item of files) {
+    const filePath = typeof item === "string" ? item : item.file;
+    const customInstruction = typeof item === "object" ? item.prompt || item.strategy : null;
+
+    if (!filePath) continue;
+
+    const result = await loadFile(ctx.cwd, filePath);
+    if (!result.found) {
       sections.push(result.content);
+      continue;
     }
+
+    const ext = filePath.split(".").pop()?.toLowerCase() || "text";
+    const lines = result.content.split("\n");
+    let finalContent = result.content;
+
+    if (lines.length > threshold) {
+      let category = "generic";
+      if (["ts", "js", "py", "go", "java", "c", "cpp", "rs", "php", "rb", "jsx", "tsx"].includes(ext)) category = "code";
+      else if (["json", "yaml", "yml", "xml", "csv", "toml", "ini", "lock"].includes(ext)) category = "config";
+      else if (["md", "mdx", "txt"].includes(ext)) category = "markdown";
+
+      let strategy = "";
+      let instructionText = customInstruction;
+
+      if (customInstruction) {
+        strategy = "custom";
+      } else if (config.interactiveContext !== false && ctx.hasUI) {
+        let options: {label: string, value: string}[] = [];
+        if (category === "markdown") {
+          options = [
+            { label: "Extract Table of Contents (Recommended)", value: "toc" },
+            { label: "Custom Prompt", value: "custom" },
+            { label: "Do Not Load (Agent Must Read)", value: "ignore" },
+            { label: "Load Full File", value: "full" }
+          ];
+        } else if (category === "code") {
+          options = [
+            { label: "Load Top & Bottom (Recommended)", value: "top_bottom" },
+            { label: "Custom Prompt", value: "custom" },
+            { label: "Do Not Load (Agent Must Read)", value: "ignore" },
+            { label: "Load Full File", value: "full" }
+          ];
+        } else if (category === "config") {
+          options = [
+            { label: "Do Not Load (Recommended)", value: "ignore" },
+            { label: "Custom Prompt", value: "custom" },
+            { label: "Load Full File", value: "full" }
+          ];
+        } else {
+          options = [
+            { label: "Truncate to Last 2,000 Lines (Recommended)", value: "truncate" },
+            { label: "Custom Prompt", value: "custom" },
+            { label: "Do Not Load (Agent Must Read)", value: "ignore" },
+            { label: "Load Full File", value: "full" }
+          ];
+        }
+
+        const promptDesc = `File ${filePath} is very large (${lines.length} lines).\nHow should the agent handle it?\n\nOptions:\n${options.map((o, i) => `${i+1}. ${o.label}`).join("\n")}`;
+        
+        const choice = await ctx.ui.select(
+          `Large Context File: ${filePath}`,
+          options.map(o => o.value),
+          { description: promptDesc } as any
+        );
+
+        strategy = choice || options[0].value;
+        if (strategy === "custom") {
+          instructionText = await ctx.ui.input("Custom Prompt for File", "e.g., Focus only on the verifyToken function");
+        }
+      } else {
+        // Auto fallback
+        strategy = category === "markdown" ? "toc" : category === "code" ? "top_bottom" : category === "config" ? "ignore" : "truncate";
+      }
+
+      // Apply Strategy
+      if (strategy === "toc") {
+        const toc = lines.filter(l => l.trim().startsWith("#")).join("\n");
+        finalContent = `[File too large. Showing Outline only. Use 'read' tool to read specific sections.]\n\n${toc}`;
+      } else if (strategy === "top_bottom") {
+        const top = lines.slice(0, 250).join("\n");
+        const bottom = lines.slice(-750).join("\n");
+        finalContent = `${top}\n\n[...TRUNCATED ${lines.length - 1000} MIDDLE LINES. USE 'read' TOOL IF NEEDED...]\n\n${bottom}`;
+      } else if (strategy === "ignore") {
+        finalContent = `[File size too large to inject directly. Use your 'read' or 'bash grep' tools to inspect this file.]`;
+      } else if (strategy === "truncate") {
+        finalContent = `[...TRUNCATED FIRST PORTION...]\n${lines.slice(-2000).join("\n")}`;
+      } else if (strategy === "custom") {
+        finalContent = `[File Not Loaded Directly. Developer Instructions: ${instructionText || "Read manually"}]`;
+      }
+
+      await logContextAudit(ctx.cwd, `[${new Date().toISOString()}] [run_spec] SPEC: ${specId}\nFILE: ${filePath}\nTYPE: ${category}\nSIZE: ${lines.length} lines (Threshold: ${threshold})\nACTION: ${strategy}\nRESULT: ${strategy === "custom" ? instructionText : "Applied " + strategy}`);
+    }
+
+    sections.push(`### File: \`${filePath}\`\n\`\`\`${ext}\n${finalContent}\n\`\`\``);
   }
 
   return sections.join("\n\n---\n\n");
@@ -544,6 +647,28 @@ export default function (pi: ExtensionAPI) {
       const content = fm.join("\n");
       await fs.writeFile(filePath, content, "utf8");
       
+      let contextWarning = "";
+      if (params.context && params.context.length > 0) {
+        const threshold = config.largeFileThreshold || 1000;
+        const largeFiles = [];
+        for (const file of params.context) {
+          try {
+            const fileContent = await fs.readFile(path.resolve(ctx.cwd, typeof file === "string" ? file : (file as any).file), "utf8");
+            const lines = fileContent.split("\n").length;
+            if (lines > threshold) largeFiles.push({ file: typeof file === "string" ? file : (file as any).file, lines });
+          } catch(e) {}
+        }
+        
+        if (largeFiles.length > 0) {
+          contextWarning = `\n\n⚠️ **Context Warning:** The following files exceed the size threshold (${threshold} lines):\n`;
+          for (const lf of largeFiles) {
+            contextWarning += `- \`${lf.file}\` (${lf.lines} lines)\n`;
+            await logContextAudit(ctx.cwd, `[${new Date().toISOString()}] [create_spec] SPEC: ${params.id}\nFILE: ${lf.file}\nSIZE: ${lf.lines} lines (Threshold: ${threshold})\nACTION: Warned user`);
+          }
+          contextWarning += `\n**How to solve this:**\n1. **Pre-configure now:** Open \`${path.relative(ctx.cwd, filePath)}\` and change the file string to an inline JSON object (e.g., \`- '{"file": "...", "prompt": "..."}'\`).\n2. **Resolve later:** Do nothing now. When you execute \`run_spec\`, the CLI will pause and offer you interactive options based on the file type (if interactiveContext is enabled).\n\n*(This warning has been recorded in \`.pi/context-audit.log\`)*`;
+        }
+      }
+
       const tokens = Math.ceil(params.requirements.length / 4);
       let weightStr = "";
       const limitMedium = config.tokenLimits?.medium || 250;
@@ -554,7 +679,7 @@ export default function (pi: ExtensionAPI) {
       else weightStr = `🔴 Heavy (~${tokens} tokens). Consider moving code blocks to context files!`;
       
       return {
-        content: [{ type: "text", text: `✅ Spec created at \`${path.relative(ctx.cwd, filePath)}\`\n\n**Token Weight:** ${weightStr}` }],
+        content: [{ type: "text", text: `✅ Spec created at \`${path.relative(ctx.cwd, filePath)}\`\n\n**Token Weight:** ${weightStr}${contextWarning}` }],
         details: {},
       };
     }
@@ -828,7 +953,7 @@ export default function (pi: ExtensionAPI) {
 
       let resolvedContext = "";
       if (fm.context && fm.context.length > 0) {
-        resolvedContext = await resolveContext(ctx.cwd, fm.context);
+        resolvedContext = await resolveContext(ctx, config, fm.id, fm.context);
       }
 
       const header = [
