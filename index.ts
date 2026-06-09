@@ -59,6 +59,7 @@ interface ProjectConfig {
   };
   interactiveContext?: boolean; // Show UI prompts for large files (default true)
   largeFileThreshold?: number;  // Lines threshold for interactive prompts (default 1000)
+  protectedPaths?: string[];    // Paths requiring unlock for markdown edits
 }
 
 // ============================================================
@@ -79,7 +80,8 @@ const DEFAULT_CONFIG: ProjectConfig = {
     heavy: 750
   },
   interactiveContext: true,
-  largeFileThreshold: 1000
+  largeFileThreshold: 1000,
+  protectedPaths: ["specs/", "docs/"]
 };
 
 // ============================================================
@@ -206,12 +208,16 @@ function parseFrontmatter(content: string): {
   return { frontmatter: fm as SpecFrontmatter, body };
 }
 
-async function logContextAudit(cwd: string, text: string) {
+async function appendAuditLog(cwd: string, filename: string, text: string) {
   try {
     const piDir = path.resolve(cwd, ".pi");
     await fs.mkdir(piDir, { recursive: true });
-    await fs.appendFile(path.resolve(piDir, "context-audit.log"), text + "\n---\n");
+    await fs.appendFile(path.resolve(piDir, filename), text + "\n---\n");
   } catch (e) {}
+}
+
+async function logContextAudit(cwd: string, text: string) {
+  await appendAuditLog(cwd, "context-audit.log", text);
 }
 
 async function loadFile(cwd: string, filePath: string): Promise<{ path: string; content: string; found: boolean }> {
@@ -438,9 +444,12 @@ function buildInstructions(fm: SpecFrontmatter, config: ProjectConfig): string {
     parts.push(`3. Call \`verify_spec\` to confirm no tests are required, then call \`git_commit\`, and finally call \`spec_complete\`.`);
   }
 
-  const rules = config.rules && config.rules.length > 0 
+  const rules = [...(config.rules && config.rules.length > 0 
     ? config.rules 
-    : ["Complete one file at a time.", "Read existing files before editing."];
+    : ["Complete one file at a time.", "Read existing files before editing."])];
+
+  const protectedList = (config.protectedPaths || ["specs/", "docs/"]).join(", ");
+  rules.push(`You MUST use 'request_file_unlock' before editing .md files in: ${protectedList}.`);
 
   parts.push("");
   parts.push("**Rules:** " + rules.join(" "));
@@ -534,6 +543,41 @@ async function logGitAction(ctx: ExtensionContext, specId: string, cmd: string, 
 }
 
 export default function (pi: ExtensionAPI) {
+  const unlockedFiles = new Set<string>();
+
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName !== "edit" && event.toolName !== "write" && event.toolName !== "bash") return undefined;
+
+    const config = await loadConfig(ctx.cwd);
+    const protectedPaths = config.protectedPaths || ["specs/", "docs/"];
+
+    if (event.toolName === "edit" || event.toolName === "write") {
+      const input = event.input as any;
+      if (!input.path) return undefined;
+      const filePath = input.path as string;
+      
+      const isProtected = protectedPaths.some(p => filePath.startsWith(p));
+      const isMarkdown = filePath.toLowerCase().endsWith(".md") || filePath.toLowerCase().endsWith(".mdx");
+
+      if (isProtected && isMarkdown && !unlockedFiles.has(filePath)) {
+        return { block: true, reason: "❌ Blocked. You MUST use 'request_file_unlock' first to modify protected documentation." };
+      }
+    } else if (event.toolName === "bash") {
+      const input = event.input as any;
+      if (!input.command) return undefined;
+      const cmd = input.command as string;
+      
+      const targetsProtectedMd = protectedPaths.some(p => cmd.includes(p)) && (cmd.includes(".md") || cmd.includes(".mdx"));
+      if (targetsProtectedMd) {
+        const isModifying = /\b(rm|mv|cp|sed|echo|cat|tee|>|>>)\b/.test(cmd);
+        if (isModifying) {
+          return { block: true, reason: "❌ Blocked. You MUST use 'request_file_unlock' and then 'edit' or 'write' to modify protected documentation. Bash modifications are blocked." };
+        }
+      }
+    }
+    return undefined;
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     const config = await loadConfig(ctx.cwd);
     const state = await loadState(ctx.cwd, config);
@@ -587,6 +631,54 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.setEditorText(`Look at the current git diff and call the git_patch tool to stash my work. Generate a descriptive filename.`);
       ctx.ui.notify("Draft prompt placed in editor. Press Enter to generate patch.", "info");
+    }
+  });
+
+  pi.registerTool({
+    name: "request_file_unlock",
+    label: "Request File Unlock",
+    description: "Use this tool to provide a justification and request permission to edit files in protected directories (e.g., specs, docs). You must wait for user approval before calling `edit` or `write`.",
+    parameters: Type.Object({
+      file: Type.String({ description: "Path to the markdown file to unlock" }),
+      justification: Type.String({ description: "Why do you need to edit this file?" })
+    }),
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      if (!ctx.hasUI) {
+        return { content: [{ type: "text", text: "❌ Blocked: Protected files cannot be edited in non-interactive mode." }], details: {}, isError: true };
+      }
+
+      const choice = await ctx.ui.select(
+        `🛑 Agent wants to unlock protected file: ${params.file}\nAI Justification: ${params.justification}`,
+        ["Approve", "Edit Justification", "Reject"]
+      );
+
+      const folder = params.file.split('/')[0] || "root";
+      const logFilename = `${folder}-audit.log`;
+
+      if (choice === "Reject" || !choice) {
+        await appendAuditLog(ctx.cwd, logFilename, `[${new Date().toISOString()}] [request_file_unlock]\nFILE: ${params.file}\nAI JUSTIFICATION: "${params.justification}"\nUSER ACTION: Rejected`);
+        return { content: [{ type: "text", text: "❌ Request Rejected by User. Do not attempt to edit this file." }], details: {}, isError: true };
+      }
+
+      let finalJustification = params.justification;
+      let actionStr = "Approved";
+      if (choice === "Edit Justification") {
+        const edited = await ctx.ui.input("Edit Justification", params.justification);
+        if (edited) {
+          finalJustification = edited;
+          actionStr = "Approved (Edited Justification)";
+        }
+      }
+
+      unlockedFiles.add(params.file);
+
+      const logContent = `[${new Date().toISOString()}] [request_file_unlock]\nFILE: ${params.file}\nAI JUSTIFICATION: "${params.justification}"\nUSER ACTION: ${actionStr}\nFINAL JUSTIFICATION: "${finalJustification}"`;
+      await appendAuditLog(ctx.cwd, logFilename, logContent);
+
+      return {
+        content: [{ type: "text", text: `✅ File unlocked. You may now proceed with your 'edit' or 'write' tool call.` }],
+        details: {}
+      };
     }
   });
 
@@ -1094,6 +1186,10 @@ export default function (pi: ExtensionAPI) {
     description: "Mark the current spec as completed. Call this after all tests pass. Persists state for cross-session tracking.",
     parameters: Type.Object({
       test_ids: Type.Optional(Type.Array(Type.String(), { description: "Test IDs that are now passing (or empty for specs without tests)" })),
+      architecture_decisions: Type.Optional(Type.Array(Type.String({ maxLength: 200 }), { 
+        maxItems: 3, 
+        description: "Max 3 bullet points. Max 200 chars each. Explain only high-level architectural choices." 
+      }))
     }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const config = await loadConfig(ctx.cwd);
@@ -1155,6 +1251,12 @@ export default function (pi: ExtensionAPI) {
       }
       state.current = undefined;
       await saveState(ctx.cwd, state, config);
+
+      if (params.architecture_decisions && params.architecture_decisions.length > 0) {
+        const decisions = params.architecture_decisions.map(d => `- ${d}`).join("\n");
+        const logContent = `[${new Date().toISOString()}] [spec_complete] SPEC: ${specId}\nARCHITECTURAL DECISIONS:\n${decisions}`;
+        await appendAuditLog(ctx.cwd, "code-audit.log", logContent);
+      }
 
       const total = Object.keys(state.completed).length;
       
