@@ -194,6 +194,14 @@ function parseFrontmatter(content: string): {
 async function loadFile(cwd: string, filePath: string): Promise<{ path: string; content: string; found: boolean }> {
   try {
     const content = await fs.readFile(path.resolve(cwd, filePath), "utf8");
+    const lines = content.split("\n");
+    if (lines.length > 2000) {
+      return { 
+        path: filePath, 
+        content: "[...TRUNCATED FIRST PORTION...]\n" + lines.slice(-2000).join("\n") + "\n\n/* ⚠️ File exceeded 2000 lines. Showing last 2000 lines. Use the `read` tool to view specific regions if needed. */", 
+        found: true 
+      };
+    }
     return { path: filePath, content, found: true };
   } catch {
     return {
@@ -680,8 +688,12 @@ export default function (pi: ExtensionAPI) {
         "Git Commit", `Agent proposes commit:\nMessage: ${params.message}`, signal
       );
 
+      let outputToReturn = "";
       if (output !== null) {
-        return { content: [{ type: "text", text: `Changes committed successfully.\n${output}` }], details: {} };
+        outputToReturn = output.length > 2000 
+          ? "[...TRUNCATED...]\n" + output.slice(-2000) 
+          : output;
+        return { content: [{ type: "text", text: `Changes committed successfully.\n${outputToReturn}` }], details: {} };
       } else {
         return { content: [{ type: "text", text: "Commit rejected by user." }], details: {}, isError: true };
       }
@@ -723,8 +735,12 @@ export default function (pi: ExtensionAPI) {
         "Git Patch", `Agent proposes creating patch: ${patchPath}\nReset after: ${params.reset_after ? "Yes" : "No"}`, signal
       );
 
+      let outputToReturn = "";
       if (output !== null) {
-        return { content: [{ type: "text", text: `Patch saved to ${patchPath}` }], details: {} };
+        outputToReturn = output.length > 2000 
+          ? "[...TRUNCATED...]\n" + output.slice(-2000) 
+          : output;
+        return { content: [{ type: "text", text: `Patch saved to ${patchPath}\n\n${outputToReturn}` }], details: {} };
       } else {
         return { content: [{ type: "text", text: "Patch creation rejected by user." }], details: {}, isError: true };
       }
@@ -907,8 +923,14 @@ export default function (pi: ExtensionAPI) {
       if (exitCode === 0) {
         state.current.verified = true;
         await saveState(ctx.cwd, state, config);
+        
+        const lines = output.split("\n");
+        const truncatedSuccess = lines.length > 15 
+          ? "[...TRUNCATED...]\n" + lines.slice(-15).join("\n") 
+          : output;
+
         return {
-          content: [{ type: "text", text: `✅ Tests passed!\n\nOUTPUT:\n${output}\n\nYou may now call spec_complete.` }],
+          content: [{ type: "text", text: `✅ Tests passed!\n\nOUTPUT (Last 15 lines):\n${truncatedSuccess}\n\nYou may now call spec_complete.` }],
           details: {},
         };
       } else {
