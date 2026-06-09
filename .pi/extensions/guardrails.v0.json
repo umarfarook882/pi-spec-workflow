@@ -1,0 +1,14 @@
+{
+  "$schema": "https://unpkg.com/@aliou/pi-guardrails@0.13.1/schema.json",
+  "features": {
+    "policies": "disabled",
+    "pathAccess": "disabled",
+    "permissionGate": "enabled"
+  },
+  "pathAccess": {
+    "mode": "ask"
+  },
+  "permissionGate": {
+    "requireConfirmation": "on"
+  }
+}
