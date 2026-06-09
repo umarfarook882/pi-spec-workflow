@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import * as fs from "node:fs/promises";
@@ -341,8 +341,10 @@ function buildInstructions(fm: SpecFrontmatter, config: ProjectConfig): string {
 // Extension
 // ============================================================
 
+type LocalBash = ReturnType<typeof createLocalBashOperations>;
+
 async function executeGitWithAudit(
-  ctx: any, bash: any, specId: string, cmd: string, 
+  ctx: ExtensionContext, bash: LocalBash, specId: string, cmd: string, 
   promptTitle: string, promptMsg: string, signal: AbortSignal | undefined
 ): Promise<string | null> {
   let isGit = false;
@@ -355,10 +357,10 @@ async function executeGitWithAudit(
 
   // Ask for confirmation or edit
   const actionStr = await ctx.ui.select(promptTitle, [
-    { label: "Approve", value: "approve" },
-    { label: "Edit Command", value: "edit" },
-    { label: "Reject", value: "reject" }
-  ], promptMsg + `\n\nCommand: ${cmd}`);
+    "approve",
+    "edit",
+    "reject"
+  ], { description: promptMsg + `\n\nCommand: ${cmd}` } as any);
 
   if (!actionStr || actionStr === "reject") {
     let auditLog = `[${new Date().toISOString()}] SPEC: ${specId}\nCMD: ${cmd}\nSTATUS: REJECTED\n---\n`;
@@ -409,7 +411,7 @@ async function executeGitWithAudit(
 }
 
 // Helper to log non-interactive, read-only or background git operations to the audit log
-async function logGitAction(ctx: any, specId: string, cmd: string, output: string, error?: string) {
+async function logGitAction(ctx: ExtensionContext, specId: string, cmd: string, output: string, error?: string) {
   try {
     let auditLog = `[${new Date().toISOString()}] SPEC: ${specId}\nCMD: ${cmd}\nSTATUS: BACKGROUND_TASK\nOUTPUT:\n${output}\n`;
     if (error) auditLog += `ERROR: ${error}\n`;
@@ -910,8 +912,28 @@ export default function (pi: ExtensionAPI) {
           details: {},
         };
       } else {
+        const errorLogPath = path.join(".pi", "last-test-failure.log");
+        try {
+          await fs.mkdir(path.resolve(ctx.cwd, ".pi"), { recursive: true });
+          await fs.writeFile(path.resolve(ctx.cwd, errorLogPath), output, "utf8");
+        } catch (e) {
+          // ignore write errors
+        }
+
+        const lines = output.split("\n");
+        const truncatedOutput = lines.length > 50 
+          ? "[...TRUNCATED...]\n" + lines.slice(-50).join("\n") 
+          : output;
+
         return {
-          content: [{ type: "text", text: `❌ Tests failed (exit code ${exitCode}). Fix the code and try verify_spec again.\n\nOUTPUT:\n${output}` }],
+          content: [{ 
+            type: "text", 
+            text: `❌ Tests failed (exit code ${exitCode}).\n\n` +
+                  `The full test output has been saved to \`${errorLogPath}\`.\n` +
+                  `If the snippet below isn't enough, use your tools (like \`read\` or \`bash grep\`) to inspect the log file.\n\n` +
+                  `OUTPUT (Last 50 lines):\n${truncatedOutput}\n\n` +
+                  `Fix the code and try verify_spec again.` 
+          }],
           details: {},
           isError: true,
         };
