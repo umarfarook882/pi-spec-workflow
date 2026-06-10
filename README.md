@@ -6,9 +6,9 @@
 
 ## Features
 
-* **Automated TDD Orchestration:** Automatically guides the AI through reading specs, writing tests, implementing code, running verification, and committing changes.
+* **Automated TDD/BDD Orchestration:** Guides the AI through reading specs, writing tests, implementing code, dynamic verification, and committing changes.
 * **Smart Context Loading:** Intelligently handles massive legacy files to prevent token bloat without losing critical context.
-* **"Source of Truth" Governance:** Protects critical documentation (`specs/`, `docs/`) from arbitrary AI modification using a human-in-the-loop approval gate.
+* **"Source of Truth" Governance:** Protects critical documentation (`specs/`, `docs/`) and audit logs from arbitrary AI access using hard firewalls and human-in-the-loop approval gates.
 * **Architectural Decision Records (ADRs):** Automatically generates a background audit log of *why* the AI made specific design choices during implementation.
 * **Safety & Reversibility:** Snapshots files before execution, auto-generates `.patch` files on failure, and audits all git commands interactively.
 
@@ -39,6 +39,8 @@ You can configure the extension by creating a `.pi/spec-workflow.json` file in y
   "interactiveContext": true,
   "largeFileThreshold": 1000,
   "protectedPaths": ["specs/", "docs/"],
+  "interactiveTesting": true,
+  "autoApproveDelayMs": 30000,
   "rules": [
     "Complete one file at a time.",
     "Read existing files before editing to understand context."
@@ -59,26 +61,26 @@ Use the `run_spec` tool to execute the spec.
 
 ### 3. Verify & Complete
 The AI writes the code and calls `verify_spec` to run the test suite.
-* **Context Protection:** Test logs are strictly truncated. Failures are capped at 50 lines (with the full error saved to `.pi/last-test-failure.log`). Successes are capped at 15 lines.
-* **Completion:** Once passing, the AI calls `spec_complete`. It automatically summarizes its design decisions and logs them to `.pi/code-audit.log`.
+* **Dynamic Testing:** If a spec omits a predefined test command, the AI proposes a bash command dynamically. The CLI pauses via a non-blocking TUI overlay, allowing you to **Approve, Edit, or Reject** the command (auto-approving after 30s to prevent API timeouts).
+* **Context Protection:** Test logs are strictly truncated. Failures are capped at 50 lines (with the full error saved to `.pi/last-test-failure.log` for debugging). Successes are capped at 15 lines.
+* **Completion:** Once passing, the AI calls `spec_complete`. It automatically summarizes its design decisions to `.pi/code-audit.log`, and the temporary failure log is physically deleted to keep the workspace clean.
 
 ---
 
 ## AI Governance & Auditing
 
-`pi-spec-workflow` treats your project's architecture with extreme care.
+`pi-spec-workflow` treats your project's architecture and context window with extreme care.
 
-### Protected Paths
-By default, the `specs/` and `docs/` folders are protected. If the AI wants to edit a Markdown file in these folders, its `edit` tool is blocked.
-1. The AI must use the `request_file_unlock` tool and provide a justification.
-2. The CLI pauses and asks the developer to **Approve**, **Edit the Justification**, or **Reject**.
-3. All decisions are permanently logged to `.pi/{folder}-audit.log`.
+### Protected Paths & The Hard Firewall
+By default, the `specs/` and `docs/` folders are protected from unauthorized *edits*, and all `.pi/*-audit.log` files are protected from being *read*.
+1. **Edits:** If the AI wants to edit a Markdown file in a protected path, its `edit` tool is blocked. It must use the `request_file_unlock` tool and provide a justification. The CLI prompts the developer to Approve, Edit, or Reject.
+2. **Reads (The Firewall):** If the AI attempts to read or `bash grep` an audit log, it is instantly hard-blocked. The AI receives a context-aware error message steering it back to the correct diagnostic files, preventing massive token window bloat.
 
-### Automated ADRs
-When a spec finishes successfully, the AI generates a concise summary (max 3 bullets, 200 chars each) of its architectural choices. This is silently appended to `.pi/code-audit.log`, creating a perfect historical record of the codebase evolution.
-
-### Git Auditing
-All background `git commit`, `git reset`, and `git patch` commands triggered by the AI are intercepted. The CLI prompts the developer to Approve or Edit the command, and the result is stored in `.pi/git-audit.log`.
+### Audit Ledgers
+The extension maintains permanent compliance ledgers in the `.pi/` directory:
+* **`.pi/test-audit.log`**: Records every test command executed, the exit code, and whether a human approved it.
+* **`.pi/git-audit.log`**: Records all background Git commits, resets, and patch generations.
+* **`.pi/code-audit.log`**: Automatically captures Architectural Decision Records (ADRs) when specs complete.
 
 ---
 
