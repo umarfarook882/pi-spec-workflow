@@ -60,6 +60,8 @@ interface ProjectConfig {
   interactiveContext?: boolean; // Show UI prompts for large files (default true)
   largeFileThreshold?: number;  // Lines threshold for interactive prompts (default 1000)
   protectedPaths?: string[];    // Paths requiring unlock for markdown edits
+  interactiveTesting?: boolean; // Prompt for dynamic test commands (default true)
+  autoApproveDelayMs?: number;  // Auto-approve delay for test prompts in ms (default 30000)
 }
 
 // ============================================================
@@ -81,7 +83,9 @@ const DEFAULT_CONFIG: ProjectConfig = {
   },
   interactiveContext: true,
   largeFileThreshold: 1000,
-  protectedPaths: ["specs/", "docs/"]
+  protectedPaths: ["specs/", "docs/"],
+  interactiveTesting: true,
+  autoApproveDelayMs: 30000
 };
 
 // ============================================================
@@ -436,13 +440,13 @@ function buildInstructions(fm: SpecFrontmatter, config: ProjectConfig): string {
   }
 
   if (fm.test_cmd) {
-    parts.push(`3. **Run tests:** Call the \`verify_spec\` tool to run \`${fm.test_cmd}\`.`);
-    parts.push(`4. If \`verify_spec\` **fails**: fix the code and call it again (max ${config.maxRetries} attempts).`);
-    parts.push(`5. If \`verify_spec\` **passes**: call \`git_commit\` to commit your changes (include spec ID in message), then call \`spec_complete\` with the passing test IDs.`);
-    parts.push(`6. If tests fail after ${config.maxRetries} attempts: call \`spec_fail\` with the error.`);
+    parts.push(`3. **Run tests:** Call the \`verify_spec\` tool to run the predefined test_cmd: \`${fm.test_cmd}\`.`);
   } else {
-    parts.push(`3. Call \`verify_spec\` to confirm no tests are required, then call \`git_commit\`, and finally call \`spec_complete\`.`);
+    parts.push(`3. **Run tests:** The spec lacks a predefined test command. Call \`verify_spec\` and provide a bash command via the 'command' parameter (e.g., 'npm test file.ts') to verify your implementation.`);
   }
+  parts.push(`4. If \`verify_spec\` **fails**: fix the code and call it again (max ${config.maxRetries} attempts).`);
+  parts.push(`5. If \`verify_spec\` **passes**: call \`git_commit\` to commit your changes (include spec ID in message), then call \`spec_complete\` with the passing test IDs.`);
+  parts.push(`6. If tests fail after ${config.maxRetries} attempts: call \`spec_fail\` with the error.`);
 
   const rules = [...(config.rules && config.rules.length > 0 
     ? config.rules 
@@ -546,12 +550,21 @@ export default function (pi: ExtensionAPI) {
   const unlockedFiles = new Set<string>();
 
   pi.on("tool_call", async (event, ctx) => {
-    if (event.toolName !== "edit" && event.toolName !== "write" && event.toolName !== "bash") return undefined;
+    if (event.toolName !== "read" && event.toolName !== "edit" && event.toolName !== "write" && event.toolName !== "bash") return undefined;
 
     const config = await loadConfig(ctx.cwd);
     const protectedPaths = config.protectedPaths || ["specs/", "docs/"];
 
-    if (event.toolName === "edit" || event.toolName === "write") {
+    if (event.toolName === "read") {
+      const input = event.input as any;
+      if (input.path && input.path.includes("-audit.log")) {
+        let correction = "These files contain no codebase context.";
+        if (input.path.includes("test-audit.log")) correction = "To see why a test failed, read '.pi/last-test-failure.log' instead.";
+        else if (input.path.includes("git-audit.log")) correction = "To see git status, use bash to run 'git status' or 'git log'.";
+        
+        return { block: true, reason: `❌ Blocked. Audit logs are for human compliance. ${correction}` };
+      }
+    } else if (event.toolName === "edit" || event.toolName === "write") {
       const input = event.input as any;
       if (!input.path) return undefined;
       const filePath = input.path as string;
@@ -567,6 +580,17 @@ export default function (pi: ExtensionAPI) {
       if (!input.command) return undefined;
       const cmd = input.command as string;
       
+      if (cmd.includes("-audit.log")) {
+        const isReading = /\b(cat|grep|tail|head|less|more|awk)\b/.test(cmd);
+        if (isReading) {
+          let correction = "These files contain no codebase context.";
+          if (cmd.includes("test-audit.log")) correction = "To see why a test failed, read '.pi/last-test-failure.log'.";
+          else if (cmd.includes("git-audit.log")) correction = "To see git status, run 'git status' or 'git log'.";
+          
+          return { block: true, reason: `❌ Blocked to prevent context bloat. Audit logs are for human compliance. ${correction}` };
+        }
+      }
+
       const targetsProtectedMd = protectedPaths.some(p => cmd.includes(p)) && (cmd.includes(".md") || cmd.includes(".mdx"));
       if (targetsProtectedMd) {
         const isModifying = /\b(rm|mv|cp|sed|echo|cat|tee|>|>>)\b/.test(cmd);
@@ -1096,7 +1120,11 @@ export default function (pi: ExtensionAPI) {
     name: "verify_spec",
     label: "Verify Spec",
     description: "Run the spec's test_cmd to verify your implementation. You must call this and get a passing result before calling spec_complete.",
-    parameters: Type.Object({}),
+    parameters: Type.Object({
+      command: Type.Optional(Type.String({ 
+        description: "If the spec frontmatter lacks a test_cmd, you MUST provide the bash command to verify your code here." 
+      }))
+    }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const config = await loadConfig(ctx.cwd);
       const state = await loadState(ctx.cwd, config);
@@ -1109,13 +1137,101 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      if (!state.current.test_cmd) {
-        state.current.verified = true;
-        await saveState(ctx.cwd, state, config);
-        return {
-          content: [{ type: "text", text: "✅ No test_cmd defined for this spec. You may now call spec_complete." }],
-          details: {},
-        };
+      let targetCmd = state.current.test_cmd;
+      let isDynamic = false;
+
+      if (!targetCmd) {
+        if (!params.command) {
+          return {
+            content: [{ type: "text", text: "❌ No test_cmd defined in spec, and no command parameter provided. You MUST provide a command to verify your code." }],
+            details: {},
+            isError: true,
+          };
+        }
+        targetCmd = params.command;
+        isDynamic = true;
+      }
+
+      if (isDynamic && config.interactiveTesting !== false && ctx.hasUI) {
+        const choice = await ctx.ui.custom<"Approve" | "Edit" | "Reject" | null>((tui, theme, kb, done) => {
+          let timeLeft = config.autoApproveDelayMs !== undefined ? Math.floor(config.autoApproveDelayMs / 1000) : 30;
+          let autoApproveTimer: any;
+
+          if (timeLeft > 0) {
+            autoApproveTimer = setInterval(() => {
+              timeLeft--;
+              if (timeLeft <= 0) {
+                clearInterval(autoApproveTimer);
+                done("Approve");
+              } else {
+                tui.requestRender();
+              }
+            }, 1000);
+          }
+
+          let selected = 0;
+          const options = ["Approve", "Edit", "Reject"];
+
+          return {
+            render: (width: number) => {
+              const lines = [
+                theme.fg("accent", `Agent wants to verify spec with:`),
+                `> ${targetCmd}`,
+                ""
+              ];
+              if (timeLeft > 0) {
+                lines.push(theme.fg("dim", `Auto-approving in ${timeLeft}s...`));
+              } else {
+                lines.push(theme.fg("dim", `Waiting for human approval...`));
+              }
+              lines.push("");
+              options.forEach((opt, i) => {
+                if (i === selected) {
+                  lines.push(theme.fg("success", `> ${opt}`));
+                } else {
+                  lines.push(`  ${opt}`);
+                }
+              });
+              return lines;
+            },
+            invalidate: () => {},
+            handleInput: (data: string) => {
+              if (data === "\x1b[A" || data === "k") {
+                selected = Math.max(0, selected - 1);
+                tui.requestRender();
+              } else if (data === "\x1b[B" || data === "j") {
+                selected = Math.min(options.length - 1, selected + 1);
+                tui.requestRender();
+              } else if (data === "\r" || data === "\n") {
+                if (autoApproveTimer) clearInterval(autoApproveTimer);
+                done(options[selected] as any);
+              } else if (data === "\x1b" || data === "\x03") {
+                if (autoApproveTimer) clearInterval(autoApproveTimer);
+                done("Reject");
+              }
+            }
+          };
+        }, { overlay: true });
+
+        if (!choice || choice === "Reject") {
+          return {
+            content: [{ type: "text", text: `❌ Command rejected by user. Propose a different test command.` }],
+            details: {},
+            isError: true,
+          };
+        }
+
+        if (choice === "Edit") {
+          const edited = await ctx.ui.input("Edit Test Command", targetCmd);
+          if (!edited) {
+            return {
+              content: [{ type: "text", text: `❌ Command edit cancelled. Propose a different test command.` }],
+              details: {},
+              isError: true,
+            };
+          }
+          targetCmd = edited;
+        }
       }
 
       ctx.ui.setStatus("spec", `Testing: ${state.current.id}`);
@@ -1125,7 +1241,7 @@ export default function (pi: ExtensionAPI) {
       
       let exitCode: number | null = null;
       try {
-        const result = await bash.exec(state.current.test_cmd, ctx.cwd, {
+        const result = await bash.exec(targetCmd, ctx.cwd, {
           onData: (data) => { output += data.toString(); },
           signal,
           timeout: config.testTimeout || 60000
@@ -1135,6 +1251,11 @@ export default function (pi: ExtensionAPI) {
         output += `\nError executing command: ${e.message}`;
       }
       
+      const statusStr = exitCode === 0 ? "Passed (Exit Code 0)" : `Failed (Exit Code ${exitCode})`;
+      const approvedByStr = isDynamic ? "Human" : "Auto-run";
+      const auditLogContent = `[${new Date().toISOString()}] Spec: ${state.current.id}\nAction: Test Execution\nProposed by: ${isDynamic ? "Agent" : "Spec Frontmatter"}\nCommand Run: \`${targetCmd}\`\nStatus: ${statusStr}\nApproved by: ${approvedByStr}\n`;
+      await appendAuditLog(ctx.cwd, "test-audit.log", auditLogContent);
+
       ctx.ui.setStatus("spec", `Running: ${state.current.id}`);
 
       if (exitCode === 0) {
@@ -1251,6 +1372,8 @@ export default function (pi: ExtensionAPI) {
       }
       state.current = undefined;
       await saveState(ctx.cwd, state, config);
+
+      await fs.rm(path.join(ctx.cwd, ".pi", "last-test-failure.log"), { force: true }).catch(() => {});
 
       if (params.architecture_decisions && params.architecture_decisions.length > 0) {
         const decisions = params.architecture_decisions.map(d => `- ${d}`).join("\n");
